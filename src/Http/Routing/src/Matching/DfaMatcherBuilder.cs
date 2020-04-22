@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing.Patterns;
+using Microsoft.AspNetCore.Routing.Template;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.AspNetCore.Routing.Matching
@@ -20,6 +21,7 @@ namespace Microsoft.AspNetCore.Routing.Matching
         private readonly IEndpointSelectorPolicy[] _endpointSelectorPolicies;
         private readonly INodeBuilderPolicy[] _nodeBuilders;
         private readonly EndpointComparer _comparer;
+        private readonly bool _useLegacy30Behavior;
 
         // These collections are reused when building candidates
         private readonly Dictionary<string, int> _assignments;
@@ -34,11 +36,25 @@ namespace Microsoft.AspNetCore.Routing.Matching
             ILoggerFactory loggerFactory,
             ParameterPolicyFactory parameterPolicyFactory,
             EndpointSelector selector,
-            IEnumerable<MatcherPolicy> policies)
+            IEnumerable<MatcherPolicy> policies,
+            bool? useLegacy30Behavior = null)
         {
             _loggerFactory = loggerFactory;
             _parameterPolicyFactory = parameterPolicyFactory;
             _selector = selector;
+
+            if (useLegacy30Behavior.HasValue)
+            {
+                _useLegacy30Behavior = useLegacy30Behavior.Value;
+            }
+            else if (AppContext.TryGetSwitch("Microsoft.AspNetCore.Routing.Use30CatchAllBehavior", out var enabled))
+            {
+                _useLegacy30Behavior = enabled;
+            }
+            else
+            {
+                _useLegacy30Behavior = false;
+            }
 
             var (nodeBuilderPolicies, endpointComparerPolicies, endpointSelectorPolicies) = ExtractPolicies(policies.OrderBy(p => p.Order));
             _endpointSelectorPolicies = endpointSelectorPolicies;
@@ -52,6 +68,9 @@ namespace Microsoft.AspNetCore.Routing.Matching
             _constraints = new List<KeyValuePair<string, IRouteConstraint>>();
         }
 
+        // Used in tests
+        internal EndpointComparer Comparer => _comparer;
+
         public override void AddEndpoint(RouteEndpoint endpoint)
         {
             _endpoints.Add(endpoint);
@@ -59,17 +78,20 @@ namespace Microsoft.AspNetCore.Routing.Matching
 
         public DfaNode BuildDfaTree(bool includeLabel = false)
         {
-            // We build the tree by doing a BFS over the list of entries. This is important
-            // because a 'parameter' node can also traverse the same paths that literal nodes
-            // traverse. This means that we need to order the entries first, or else we will
-            // miss possible edges in the DFA.
-            _endpoints.Sort(_comparer);
+            if (_useLegacy30Behavior)
+            {
+                // In 3.0 we did a global sort of the endpoints up front. This was a bug, because we actually want
+                // do do the sort at each level of the tree based on precedence.
+                //
+                // _useLegacy30Behavior enables opt-out via an AppContext switch.
+                _endpoints.Sort(_comparer);
+            }
 
             // Since we're doing a BFS we will process each 'level' of the tree in stages
             // this list will hold the set of items we need to process at the current
             // stage.
-            var work = new List<(RouteEndpoint endpoint, List<DfaNode> parents)>(_endpoints.Count);
-            List<(RouteEndpoint endpoint, List<DfaNode> parents)> previousWork = null;
+            var work = new List<(RouteEndpoint endpoint, int precedenceDigit, List<DfaNode> parents)>(_endpoints.Count);
+            List<(RouteEndpoint endpoint, int precedenceDigit, List<DfaNode> parents)> previousWork = null;
 
             var root = new DfaNode() { PathDepth = 0, Label = includeLabel ? "/" : null };
 
@@ -79,21 +101,37 @@ namespace Microsoft.AspNetCore.Routing.Matching
             for (var i = 0; i < _endpoints.Count; i++)
             {
                 var endpoint = _endpoints[i];
-                maxDepth = Math.Max(maxDepth, endpoint.RoutePattern.PathSegments.Count);
+                var precedenceDigit = GetPrecedenceDigitAtDepth(endpoint, depth: 0);
+                work.Add((endpoint, precedenceDigit, new List<DfaNode>() { root, }));
 
-                work.Add((endpoint, new List<DfaNode>() { root, }));
+                maxDepth = Math.Max(maxDepth, endpoint.RoutePattern.PathSegments.Count);
             }
+
             var workCount = work.Count;
+
+            // Sort work at each level by *PRECEDENCE OF THE CURRENT SEGMENT*.
+            //
+            // We build the tree by doing a BFS over the list of entries. This is important
+            // because a 'parameter' node can also traverse the same paths that literal nodes
+            // traverse. This means that we need to order the entries first, or else we will
+            // miss possible edges in the DFA.
+            //
+            // We'll sort the matches again later using the *real* comparer once building the
+            // precedence part of the DFA is over.
+            var precedenceDigitComparer = Comparer<(RouteEndpoint endpoint, int precedenceDigit, List<DfaNode> parents)>.Create((x, y) =>
+            {
+                return x.precedenceDigit.CompareTo(y.precedenceDigit);
+            });
 
             // Now we process the entries a level at a time.
             for (var depth = 0; depth <= maxDepth; depth++)
             {
                 // As we process items, collect the next set of items.
-                List<(RouteEndpoint endpoint, List<DfaNode> parents)> nextWork;
+                List<(RouteEndpoint endpoint, int precedenceDigit, List<DfaNode> parents)> nextWork;
                 var nextWorkCount = 0;
                 if (previousWork == null)
                 {
-                    nextWork = new List<(RouteEndpoint endpoint, List<DfaNode> parents)>();
+                    nextWork = new List<(RouteEndpoint endpoint, int precedenceDigit, List<DfaNode> parents)>();
                 }
                 else
                 {
@@ -102,9 +140,17 @@ namespace Microsoft.AspNetCore.Routing.Matching
                     nextWork = previousWork;
                 }
 
+                if (!_useLegacy30Behavior)
+                {
+                    // The fix for the 3.0 sorting behavior bug.
+
+                    // See comments on precedenceDigitComparer
+                    work.Sort(0, workCount, precedenceDigitComparer);
+                }
+
                 for (var i = 0; i < workCount; i++)
                 {
-                    var (endpoint, parents) = work[i];
+                    var (endpoint, _, parents) = work[i];
 
                     if (!HasAdditionalRequiredSegments(endpoint, depth))
                     {
@@ -122,7 +168,8 @@ namespace Microsoft.AspNetCore.Routing.Matching
                         nextParents = nextWork[nextWorkCount].parents;
                         nextParents.Clear();
 
-                        nextWork[nextWorkCount] = (endpoint, nextParents);
+                        var nextPrecedenceDigit = GetPrecedenceDigitAtDepth(endpoint, depth + 1);
+                        nextWork[nextWorkCount] = (endpoint, nextPrecedenceDigit, nextParents);
                     }
                     else
                     {
@@ -130,7 +177,8 @@ namespace Microsoft.AspNetCore.Routing.Matching
 
                         // Add to the next set of work now so the list will be reused
                         // even if there are no parents
-                        nextWork.Add((endpoint, nextParents));
+                        var nextPrecedenceDigit = GetPrecedenceDigitAtDepth(endpoint, depth + 1);
+                        nextWork.Add((endpoint, nextPrecedenceDigit, nextParents));
                     }
 
                     var segment = GetCurrentSegment(endpoint, depth);
@@ -281,7 +329,7 @@ namespace Microsoft.AspNetCore.Routing.Matching
             nextParents.Add(next);
         }
 
-        private RoutePatternPathSegment GetCurrentSegment(RouteEndpoint endpoint, int depth)
+        private static RoutePatternPathSegment GetCurrentSegment(RouteEndpoint endpoint, int depth)
         {
             if (depth < endpoint.RoutePattern.PathSegments.Count)
             {
@@ -300,6 +348,18 @@ namespace Microsoft.AspNetCore.Routing.Matching
             }
 
             return null;
+        }
+
+        private static int GetPrecedenceDigitAtDepth(RouteEndpoint endpoint, int depth)
+        {
+            var segment = GetCurrentSegment(endpoint, depth);
+            if (segment is null)
+            {
+                // Treat "no segment" as high priority. it won't effect the algorithm, but we need to define a sort-order.
+                return 0; 
+            }
+
+            return RoutePrecedence.ComputeInboundPrecedenceDigit(endpoint.RoutePattern, segment);
         }
 
         public override Matcher Build()
@@ -669,6 +729,10 @@ namespace Microsoft.AspNetCore.Routing.Matching
             {
                 return;
             }
+
+            // We're done with the precedence based work. Sort the endpoints
+            // before applying policies for simplicity in policy-related code.
+            node.Matches.Sort(_comparer);
 
             // Start with the current node as the root.
             var work = new List<DfaNode>() { node, };
