@@ -66,30 +66,6 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal
             }
         }
 
-        public void InternalAdd(string item)
-        {
-            lock (_addresses)
-            {
-                _addresses.Add(item);
-            }
-        }
-
-        public bool InternalRemove(string item)
-        {
-            lock (_addresses)
-            {
-                return _addresses.Remove(item);
-            }
-        }
-
-        public void InternalClear()
-        {
-            lock (_addresses)
-            {
-                _addresses.Clear();
-            }
-        }
-
         public bool Contains(string item)
         {
             lock (_addresses)
